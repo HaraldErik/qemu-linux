@@ -68,7 +68,7 @@ load_vm() {
     VM="$(vm_dir "$1")"
     [ -f "$VM/vm.conf" ] || die "No VM named '$1'. See: qemu-mac list"
     MACHINE=g4 RAM=1024 CPUS=1 DISK=disk.img ROM="" SHARE="" DISPLAY_UI=gtk AUDIO=auto
-    TABLET=yes GOVERNOR=on EXTRA=""
+    TABLET=no GOVERNOR=on EXTRA=""
     # shellcheck disable=SC1091
     . "$VM/vm.conf"
 }
@@ -159,7 +159,7 @@ start_vm() {
     build_cmd "$mode" "$cd"
     CMD+=("$@")
     cd "$VM"   # PRAM / NVRAM files are kept in the current directory
-    echo "${B}Starting $name ($MACHINE)${N} -- close the window or press Ctrl+Alt+Q to quit"
+    echo "${B}Starting $name ($MACHINE)${N} -- click in the window to capture the mouse, Ctrl+Alt+G releases it, Ctrl+Alt+Q quits"
     exec "${CMD[@]}"
 }
 
@@ -219,7 +219,7 @@ ROM=$( [ -n "$rom" ] && echo rom.bin )
 SHARE=""            # host folder shown to the guest as 'Shared' (needs a guest driver, see README)
 DISPLAY_UI=gtk      # gtk or sdl
 AUDIO=auto          # auto, pipewire, pa, alsa or none
-TABLET=yes          # G4/G5: mouse follows the host pointer (Mac OS X)
+TABLET=no           # yes = mouse follows the host pointer (Mac OS X 10.4+ only; 10.2/10.3 and Mac OS 9 need no)
 GOVERNOR=on         # G3 only: on for classic Mac OS, off for Mac OS X / Linux
 EXTRA=""            # extra QEMU arguments, e.g. "-vga none -device ati-radeon9800,gl=on,romfile=/path/radeon9800.rom"
 EOF

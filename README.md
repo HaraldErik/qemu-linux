@@ -143,8 +143,10 @@ works. For Mac OS X or Linux on the G3, set `GOVERNOR=off` with `qemu-mac edit c
 (see [CPU speed](#running)).
 
 > [!TIP]
-> Click inside the window to grab the mouse; press **Ctrl+Alt+G** to release it. **Ctrl+Alt+F**
-> toggles full screen. In Mac OS X on the G4/G5 the mouse follows your pointer by itself.
+> Click inside the window to capture the mouse (or touchpad); press **Ctrl+Alt+G** to release it.
+> **Ctrl+Alt+F** toggles full screen. On Mac OS X 10.4 and 10.5 (G4/G5) you can set `TABLET=yes`
+> with `qemu-mac edit NAME` so the pointer moves in and out of the window freely. Leave it off for
+> Mac OS 9 and Mac OS X 10.0 – 10.3: they have no driver for the USB tablet and the mouse won't move.
 
 ---
 
@@ -184,7 +186,7 @@ ROM=                # G3 only
 SHARE=""            # host folder shown to the guest as 'Shared'
 DISPLAY_UI=gtk      # gtk or sdl
 AUDIO=auto          # auto, pipewire, pa, alsa or none
-TABLET=yes          # G4/G5: mouse follows the host pointer (Mac OS X)
+TABLET=no           # yes = mouse follows the host pointer (Mac OS X 10.4+ only)
 GOVERNOR=on         # G3 only: on for classic Mac OS, off for Mac OS X / Linux
 EXTRA=""            # extra QEMU arguments
 ```
@@ -224,6 +226,7 @@ curl -fsSL https://raw.githubusercontent.com/HaraldErik/qemu-linux/G3-rom/instal
 | `qemu-mac: command not found` | `~/.local/bin` is not in `PATH` — see the tip under [Install](#install-on-linux) |
 | `ERROR: Dependency "…" not found` while building | Your distribution names a package differently. Install its `-devel`/`-dev` package and rerun with `--no-deps` |
 | `python3 venv/ensurepip is missing` | Debian/Ubuntu: `sudo apt install python3-venv` |
+| Mouse/touchpad doesn't move | Click in the window first. If it still doesn't move, set `TABLET=no` (`qemu-mac edit NAME`) — Mac OS 9 and Mac OS X 10.0 – 10.3 can't use the USB tablet |
 | No sound | `qemu-mac doctor` lists the audio backends; set `AUDIO=pa` or `AUDIO=alsa` in `vm.conf` |
 | G4/G5 shows the OpenBIOS prompt instead of booting | The disk has no system yet — use `qemu-mac install NAME DISC.iso` first |
 | Classic Mac OS on the G3 quits with "divide by zero" | Keep `GOVERNOR=on` |
