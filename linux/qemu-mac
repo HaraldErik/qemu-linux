@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# qemu-mac -- create and run Power Mac G3/G4/G5 virtual machines with the
+# qemu-linux builds (https://github.com/HaraldErik/qemu-linux).
+#
+# Each VM is a folder with a disk image, its PRAM/NVRAM and a vm.conf.
+
+set -euo pipefail
+
+QEMU_LINUX_PREFIX_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/qemu-linux"
+PREFIX="${QEMU_LINUX_PREFIX:-$QEMU_LINUX_PREFIX_DEFAULT}"
+VMS="${QEMU_MAC_VMS:-$PREFIX/vms}"
+
+if [ -t 1 ]; then B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'; else B=; R=; G=; Y=; N=; fi
+ok()   { printf '%s ✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s !%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s ✗ %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+${B}qemu-mac${N} -- Power Mac G3/G4/G5 virtual machines
+
+  qemu-mac new NAME [options]     Create a VM
+      -m, --machine g3|g4|g5        Machine (default g4)
+      -s, --size SIZE               Disk size, e.g. 20G (default: g3 4G, g4 20G, g5 40G)
+      -r, --ram MB                  Memory in MB (default: g3 512, g4 1024, g5 2048)
+      -c, --cpus N                  CPUs, G4/G5 only (default: g4 1, g5 2)
+          --rom FILE                Apple Beige G3 ROM (required for g3)
+          --disk FILE               Use an existing disk image instead of a new one
+  qemu-mac install NAME DISC.iso  Boot the VM from an install CD/DVD image
+  qemu-mac run NAME [qemu args]   Start the VM from its disk
+  qemu-mac cd NAME DISC.iso       Start from disk with a CD inserted
+  qemu-mac list                   List VMs
+  qemu-mac edit NAME              Edit the VM's settings (vm.conf)
+  qemu-mac show NAME              Print the full QEMU command line
+  qemu-mac path NAME              Print the VM folder
+  qemu-mac delete NAME            Delete a VM
+  qemu-mac doctor                 Check the installed emulators
+
+VMs live in $VMS
+Settings in vm.conf: RAM, CPUS, SHARE (a host folder to share), DISPLAY
+(gtk|sdl), AUDIO (auto|pipewire|pa|alsa|none), TABLET, GOVERNOR (g3), EXTRA.
+EOF
+}
+
+machine_binary() { case "$1" in g5) echo qemu-system-ppc64 ;; *) echo qemu-system-ppc ;; esac; }
+
+qemu_bin() {
+    local b="$PREFIX/$1/bin/$(machine_binary "$1")"
+    [ -x "$b" ] || die "The $1 emulator is not installed. Run the installer with --machine $1."
+    echo "$b"
+}
+
+qemu_img() {
+    local m
+    for m in g4 g5 g3; do
+        [ -x "$PREFIX/$m/bin/qemu-img" ] && { echo "$PREFIX/$m/bin/qemu-img"; return; }
+    done
+    command -v qemu-img || die "qemu-img not found."
+}
+
+vm_dir() {
+    [ -n "${1:-}" ] || die "Missing VM name."
+    case "$1" in */*|.*) die "Bad VM name: $1" ;; esac
+    echo "$VMS/$1"
+}
+
+load_vm() {
+    VM="$(vm_dir "$1")"
+    [ -f "$VM/vm.conf" ] || die "No VM named '$1'. See: qemu-mac list"
+    MACHINE=g4 RAM=1024 CPUS=1 DISK=disk.img ROM="" SHARE="" DISPLAY_UI=gtk AUDIO=auto
+    TABLET=yes GOVERNOR=on EXTRA=""
+    # shellcheck disable=SC1091
+    . "$VM/vm.conf"
+}
+
+pick_audio() {
+    local bin="$1" want="$2" have
+    have="$("$bin" -audiodev help 2>/dev/null || true)"
+    if [ "$want" = auto ]; then
+        local rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        if grep -qx pipewire <<<"$have" && [ -S "$rt/pipewire-0" ]; then want=pipewire
+        elif grep -qx pa <<<"$have" && [ -S "$rt/pulse/native" ]; then want=pa
+        else want=none; fi   # plain ALSA fails hard if busy; set AUDIO=alsa yourself
+    fi
+    echo "$want"
+}
+
+# build_cmd MODE [CDROM] -> fills the CMD array. MODE: install | run | cd
+build_cmd() {
+    local mode="$1" cd="${2:-}" bin audio fw
+    bin="$(qemu_bin "$MACHINE")"
+    audio="$(pick_audio "$bin" "$AUDIO")"
+    fw="$PREFIX/$MACHINE/share/qemu-linux/openbios-qemu.elf"
+    CMD=("$bin")
+
+    case "$MACHINE" in
+    g3)
+        [ -n "$ROM" ] || die "The G3 needs a ROM: set ROM= in $VM/vm.conf"
+        CMD+=(-M "g3beige,calibration-governor=$GOVERNOR" -m "$RAM" -bios "$ROM")
+        [ -n "$audio" ] && CMD+=(-audiodev "$audio,id=snd" -global awacs.audiodev=snd)
+        CMD+=(-nic user,model=bmac -drive "file=$DISK,format=raw,media=disk")
+        # The ROM ignores -boot; a blank disk falls through to the CD.
+        [ -n "$cd" ] && CMD+=(-cdrom "$cd")
+        if [ -n "$SHARE" ]; then
+            if [ -f "$VM/virtio-9p.rom" ]; then
+                CMD+=(-fsdev "local,id=hostshare,path=$SHARE,security_model=none,macos_compat=on"
+                      -device "virtio-9p-pci,fsdev=hostshare,mount_tag=Shared,romfile=$VM/virtio-9p.rom,addr=0x0d")
+            else
+                warn "SHARE needs virtio-9p.rom (github.com/cat7/classicvirtio) in $VM; skipping."
+            fi
+        fi
+        ;;
+    g4)
+        [ -f "$fw" ] || die "OpenBIOS missing: $fw"
+        CMD+=(-M mac99,via=pmu -m "$RAM" -smp "$CPUS" -bios "$fw")
+        [ -n "$audio" ] && CMD+=(-audiodev "$audio,id=snd" -global screamer.audiodev=snd)
+        CMD+=(-nic user,model=sungem -drive "file=$DISK,format=raw,media=disk"
+              -drive if=none,id=nvr,file=nvram.img,format=raw -global macio-nvram.drive=nvr)
+        [ -n "$cd" ] && CMD+=(-cdrom "$cd")
+        if [ -n "$SHARE" ]; then
+            CMD+=(-fsdev "local,id=hostshare,path=$SHARE,security_model=none,macos_compat=on"
+                  -device virtio-9p-pci,fsdev=hostshare,mount_tag=Shared)
+        fi
+        ;;
+    g5)
+        [ -f "$fw" ] || die "OpenBIOS missing: $fw"
+        CMD+=(-M mac99,via=pmu -cpu 970fx -smp "$CPUS" -m "$RAM" -bios "$fw")
+        [ -n "$audio" ] && CMD+=(-audiodev "$audio,id=snd0" -global macio-newworld.audiodev=snd0)
+        CMD+=(-nic user,model=sungem
+              -drive "file=$DISK,format=raw,if=none,id=sata0" -device ide-hd,bus=sata.0,drive=sata0)
+        [ -n "$cd" ] && CMD+=(-cdrom "$cd")
+        if [ -n "$SHARE" ]; then
+            CMD+=(-fsdev "local,id=hostshare,path=$SHARE,security_model=none,macos_compat=on"
+                  -device virtio-9p-pci,bus=pcix1,addr=0x2,fsdev=hostshare,mount_tag=Shared)
+        fi
+        ;;
+    *) die "Unknown MACHINE=$MACHINE in $VM/vm.conf" ;;
+    esac
+
+    if [ "$MACHINE" != g3 ]; then
+        if [ "$mode" = install ]; then CMD+=(-boot d); else CMD+=(-boot c); fi
+        [ "$TABLET" = yes ] && CMD+=(-device usb-tablet)
+    fi
+    CMD+=(-display "$DISPLAY_UI" -name "$(basename "$VM") ($MACHINE)")
+    if [ -n "$EXTRA" ]; then
+        local -a extra
+        read -r -a extra <<<"$EXTRA"
+        CMD+=("${extra[@]}")
+    fi
+}
+
+start_vm() {
+    local mode="$1" name="$2" cd="${3:-}"; shift 3 || shift $#
+    load_vm "$name"
+    if [ -n "$cd" ]; then
+        [ -f "$cd" ] || die "Disc image not found: $cd"
+        cd="$(realpath "$cd")"
+    fi
+    build_cmd "$mode" "$cd"
+    CMD+=("$@")
+    cd "$VM"   # PRAM / NVRAM files are kept in the current directory
+    echo "${B}Starting $name ($MACHINE)${N} -- close the window or press Ctrl+Alt+Q to quit"
+    exec "${CMD[@]}"
+}
+
+cmd_new() {
+    local name="${1:-}"; [ -n "$name" ] && shift || true
+    local machine=g4 size="" ram="" cpus="" rom="" disk=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m|--machine) machine="$2"; shift ;;
+            -s|--size) size="$2"; shift ;;
+            -r|--ram) ram="$2"; shift ;;
+            -c|--cpus) cpus="$2"; shift ;;
+            --rom) rom="$2"; shift ;;
+            --disk) disk="$2"; shift ;;
+            *) die "Unknown option for new: $1" ;;
+        esac
+        shift
+    done
+    [ -n "$name" ] || die "Usage: qemu-mac new NAME --machine g3|g4|g5"
+    machine="$(echo "$machine" | tr 'A-Z' 'a-z')"
+    case "$machine" in g3|g4|g5) ;; *) die "Machine must be g3, g4 or g5." ;; esac
+    qemu_bin "$machine" >/dev/null
+    local dir; dir="$(vm_dir "$name")"
+    [ ! -e "$dir" ] || die "A VM named '$name' already exists: $dir"
+
+    case "$machine" in
+        g3) : "${size:=4G}" "${ram:=512}" "${cpus:=1}" ;;
+        g4) : "${size:=20G}" "${ram:=1024}" "${cpus:=1}" ;;
+        g5) : "${size:=40G}" "${ram:=2048}" "${cpus:=2}" ;;
+    esac
+    [ "$machine" = g4 ] && [ "$ram" -gt 2048 ] && { warn "The G4 takes at most 2048 MB; using 2048."; ram=2048; }
+    [ "$machine" = g3 ] && [ "$ram" -gt 1536 ] && { warn "The G3 guest sees at most 1536 MB (three 512 MB DIMMs); using 1536."; ram=1536; }
+
+    if [ "$machine" = g3 ]; then
+        [ -n "$rom" ] || die "The G3 needs Apple's Beige G3 ROM (4 MB, PowerMacG3v3.ROM): add --rom FILE"
+        [ -f "$rom" ] || die "ROM not found: $rom"
+    fi
+    if [ -n "$disk" ]; then [ -f "$disk" ] || die "Disk not found: $disk"; fi
+
+    mkdir -p "$dir"
+    if [ -n "$rom" ]; then cp "$rom" "$dir/rom.bin"; fi
+    if [ -n "$disk" ]; then
+        ln -s "$(realpath "$disk")" "$dir/disk.img"
+    else
+        "$(qemu_img)" create -q -f raw "$dir/disk.img" "$size"
+    fi
+    if [ "$machine" = g4 ]; then
+        dd if=/dev/zero of="$dir/nvram.img" bs=8192 count=1 status=none
+    fi
+    cat > "$dir/vm.conf" <<EOF
+# qemu-mac settings for '$name'. Lines are shell variables.
+MACHINE=$machine
+RAM=$ram            # MB
+CPUS=$cpus          # G4/G5 only; Mac OS X 10.3 uses at most 2
+DISK=disk.img
+ROM=$( [ -n "$rom" ] && echo rom.bin )
+SHARE=""            # host folder shown to the guest as 'Shared' (needs a guest driver, see README)
+DISPLAY_UI=gtk      # gtk or sdl
+AUDIO=auto          # auto, pipewire, pa, alsa or none
+TABLET=yes          # G4/G5: mouse follows the host pointer (Mac OS X)
+GOVERNOR=on         # G3 only: on for classic Mac OS, off for Mac OS X / Linux
+EXTRA=""            # extra QEMU arguments, e.g. "-vga none -device ati-radeon9800,gl=on,romfile=/path/radeon9800.rom"
+EOF
+    ok "Created $name ($machine, $size disk, $ram MB) in $dir"
+    echo "   Next: qemu-mac install $name /path/to/install.iso"
+}
+
+cmd_list() {
+    [ -d "$VMS" ] || { echo "No VMs yet. Create one with: qemu-mac new NAME --machine g4"; return; }
+    local d found=0
+    for d in "$VMS"/*/; do
+        [ -f "$d/vm.conf" ] || continue
+        found=1
+        local m r s
+        m="$(sed -n 's/^MACHINE=\([^ ]*\).*/\1/p' "$d/vm.conf")"
+        r="$(sed -n 's/^RAM=\([^ ]*\).*/\1/p' "$d/vm.conf")"
+        s="$(du -shL "$d/disk.img" 2>/dev/null | cut -f1)"
+        printf '  %-20s %-3s %6s MB  disk %s used\n' "$(basename "$d")" "$m" "$r" "${s:-?}"
+    done
+    [ "$found" = 1 ] || echo "No VMs yet. Create one with: qemu-mac new NAME --machine g4"
+}
+
+cmd_doctor() {
+    local m b
+    echo "Install prefix: $PREFIX"
+    for m in g3 g4 g5; do
+        b="$PREFIX/$m/bin/$(machine_binary "$m")"
+        if [ -x "$b" ]; then
+            printf '  %s  %-18s %s (%s)\n' "$G✓$N" "$m $(machine_binary "$m")" \
+                "$("$b" --version | head -1)" "$(cat "$PREFIX/$m/.source" 2>/dev/null || echo ?) $(cat "$PREFIX/$m/.commit" 2>/dev/null)"
+            if [ "$m" != g3 ]; then
+                if [ -f "$PREFIX/$m/share/qemu-linux/openbios-qemu.elf" ]; then
+                    printf '     OpenBIOS ok\n'
+                else
+                    printf '     %sOpenBIOS missing%s\n' "$R" "$N"
+                fi
+            fi
+            printf '     audio: %s\n' "$("$b" -audiodev help | tail -n +2 | tr '\n' ' ')"
+        else
+            printf '  -  %s not installed\n' "$m"
+        fi
+    done
+}
+
+main() {
+    local cmd="${1:-help}"; [ $# -gt 0 ] && shift
+    case "$cmd" in
+        new|create) cmd_new "$@" ;;
+        install)
+            [ $# -ge 2 ] || die "Usage: qemu-mac install NAME DISC.iso"
+            local n="$1" c="$2"; shift 2; start_vm install "$n" "$c" "$@" ;;
+        run|start)
+            [ $# -ge 1 ] || die "Usage: qemu-mac run NAME"
+            local n="$1"; shift; start_vm run "$n" "" "$@" ;;
+        cd)
+            [ $# -ge 2 ] || die "Usage: qemu-mac cd NAME DISC.iso"
+            local n="$1" c="$2"; shift 2; start_vm cd "$n" "$c" "$@" ;;
+        show)
+            load_vm "${1:-}"; build_cmd run ""
+            local a; printf 'cd %q &&' "$VM"
+            for a in "${CMD[@]}"; do
+                if [[ "$a" =~ ^[A-Za-z0-9_./=,:+@%-]+$ ]]; then printf ' %s' "$a"; else printf ' %q' "$a"; fi
+            done
+            echo ;;
+        list|ls) cmd_list ;;
+        edit) load_vm "${1:-}"; "${EDITOR:-nano}" "$VM/vm.conf" ;;
+        path) load_vm "${1:-}"; echo "$VM" ;;
+        delete|rm)
+            load_vm "${1:-}"
+            local a=""; read -r -p "Delete $VM and its disk? [y/N] " a
+            [ "$a" = y ] || [ "$a" = Y ] || { echo "Kept."; return; }
+            rm -rf "$VM"; ok "Deleted ${1}" ;;
+        doctor) cmd_doctor ;;
+        help|-h|--help) usage ;;
+        *) die "Unknown command: $cmd (see qemu-mac help)" ;;
+    esac
+}
+
+main "$@"
